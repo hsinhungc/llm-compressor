@@ -110,6 +110,7 @@ celerybeat-schedule
 
 # Environments
 .env
+.conda/
 .venv
 env/
 venv/
