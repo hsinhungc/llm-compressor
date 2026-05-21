@@ -77,6 +77,23 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs to use with tensor parallelism.",
     )
     parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        help="Optional vLLM max number of active sequences.",
+    )
+    parser.add_argument(
+        "--warmup-prompts",
+        type=int,
+        default=0,
+        help="Number of prompts to run before recording latency measurements.",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="Number of measured passes over the prompt set.",
+    )
+    parser.add_argument(
         "--dtype",
         default="auto",
         choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
@@ -96,6 +113,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt-file",
         help="Optional text file containing one prompt per line.",
+    )
+    parser.add_argument(
+        "--include-text",
+        action="store_true",
+        help="Store full prompts and generated text in the JSON result.",
     )
     return parser.parse_args()
 
@@ -178,6 +200,7 @@ class MemoryTracker:
         self._running = False
         self._thread = None
         self.samples_mib: list[float] = []
+        self._lock = threading.Lock()
 
     def current_mib(self) -> float | None:
         if pynvml is None:
@@ -199,11 +222,20 @@ class MemoryTracker:
         self._running = False
         self._thread.join(timeout=2.0)
 
+    def peak_mib(self) -> float | None:
+        with self._lock:
+            return max(self.samples_mib) if self.samples_mib else None
+
+    def reset(self) -> None:
+        with self._lock:
+            self.samples_mib.clear()
+
     def _poll(self) -> None:
         while self._running:
             value = self.current_mib()
             if value is not None:
-                self.samples_mib.append(value)
+                with self._lock:
+                    self.samples_mib.append(value)
             time.sleep(self.interval_s)
 
 
@@ -220,6 +252,7 @@ async def benchmark_prompt(
     prompt: str,
     request_id: str,
     max_tokens: int,
+    include_text: bool,
 ) -> dict[str, Any]:
     sampling_params = SamplingParams(
         temperature=0.0,
@@ -247,8 +280,6 @@ async def benchmark_prompt(
             text = getattr(completion, "text", "")
             if text:
                 generated_text_parts.append(text)
-        if output.finished:
-            break
 
     end = time.perf_counter()
     if first_token_at is None:
@@ -261,19 +292,29 @@ async def benchmark_prompt(
     if output_tokens > 1:
         decode_ms_per_token = ((end - first_token_at) * 1000.0) / (output_tokens - 1)
 
-    return {
-        "prompt": prompt,
-        "generated_text": "".join(generated_text_parts),
+    generated_text = "".join(generated_text_parts)
+    result = {
+        "prompt_preview": prompt[:240],
+        "generated_text_preview": generated_text[:240],
         "output_tokens": output_tokens,
         "total_latency_ms": total_latency_ms,
         "ttft_ms": ttft_ms,
         "ms_per_token": ms_per_token,
         "decode_ms_per_token": decode_ms_per_token,
     }
+    if include_text:
+        result["prompt"] = prompt
+        result["generated_text"] = generated_text
+    return result
 
 
 async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     prompts = load_prompts(args.prompt_file)
+    if args.repeats < 1:
+        raise ValueError("--repeats must be at least 1")
+    if args.warmup_prompts < 0:
+        raise ValueError("--warmup-prompts cannot be negative")
+
     gpu_index = get_visible_gpu_index()
     temp_dirs: list[tempfile.TemporaryDirectory] = []
     model_for_vllm = prepare_vllm_model_path(args.model, temp_dirs)
@@ -285,30 +326,53 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     baseline_memory = tracker.current_mib()
     tracker.start()
 
+    engine_kwargs = {
+        "model": model_for_vllm,
+        "trust_remote_code": True,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_model_len": args.max_model_len,
+        "kv_cache_dtype": args.kv_cache_dtype,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "dtype": args.dtype,
+        "enforce_eager": args.enforce_eager,
+    }
+    if args.max_num_seqs is not None:
+        engine_kwargs["max_num_seqs"] = args.max_num_seqs
+
     engine_args = AsyncEngineArgs(
-        model=model_for_vllm,
-        trust_remote_code=True,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.max_model_len,
-        kv_cache_dtype=args.kv_cache_dtype,
-        tensor_parallel_size=args.tensor_parallel_size,
-        dtype=args.dtype,
-        enforce_eager=args.enforce_eager,
+        **engine_kwargs,
     )
     engine = AsyncLLMEngine.from_engine_args(engine_args)
 
     try:
         post_load_memory = tracker.current_mib()
         per_prompt_results = []
-        for idx, prompt in enumerate(prompts):
-            per_prompt_results.append(
-                await benchmark_prompt(
+        for idx in range(args.warmup_prompts):
+            prompt = prompts[idx % len(prompts)]
+            await benchmark_prompt(
+                engine=engine,
+                prompt=prompt,
+                request_id=f"{args.label}-warmup-{idx}",
+                max_tokens=args.max_tokens,
+                include_text=False,
+            )
+
+        load_peak_memory = tracker.peak_mib()
+        tracker.reset()
+
+        for repeat_idx in range(args.repeats):
+            for prompt_idx, prompt in enumerate(prompts):
+                result = await benchmark_prompt(
                     engine=engine,
                     prompt=prompt,
-                    request_id=f"{args.label}-{idx}",
+                    request_id=f"{args.label}-r{repeat_idx}-p{prompt_idx}",
                     max_tokens=args.max_tokens,
+                    include_text=args.include_text,
                 )
-            )
+                result["repeat"] = repeat_idx
+                result["prompt_index"] = prompt_idx
+                per_prompt_results.append(result)
+        measured_peak_memory = tracker.peak_mib()
     finally:
         engine.shutdown_background_loop()
         tracker.stop()
@@ -318,7 +382,10 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         for temp_dir in temp_dirs:
             temp_dir.cleanup()
 
-    peak_memory = max(tracker.samples_mib) if tracker.samples_mib else None
+    peak_candidates = [
+        value for value in [load_peak_memory, measured_peak_memory] if value is not None
+    ]
+    peak_memory = max(peak_candidates) if peak_candidates else None
     avg_ms_per_token = mean(
         result["ms_per_token"]
         for result in per_prompt_results
@@ -340,12 +407,19 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "dtype": args.dtype,
         "max_model_len": args.max_model_len,
         "max_tokens": args.max_tokens,
-        "prompt_count": len(prompts),
+        "max_num_seqs": args.max_num_seqs,
+        "base_prompt_count": len(prompts),
+        "prompt_count": len(per_prompt_results),
+        "warmup_prompts": args.warmup_prompts,
+        "repeats": args.repeats,
+        "include_text": args.include_text,
         "avg_ms_per_token": avg_ms_per_token,
         "avg_ttft_ms": avg_ttft_ms,
         "avg_decode_ms_per_token": avg_decode_ms_per_token,
         "baseline_gpu_memory_mib": baseline_memory,
         "post_load_gpu_memory_mib": post_load_memory,
+        "load_peak_gpu_memory_mib": load_peak_memory,
+        "measured_peak_gpu_memory_mib": measured_peak_memory,
         "peak_gpu_memory_mib": peak_memory,
         "final_gpu_memory_mib": final_memory,
         "per_prompt": per_prompt_results,
@@ -361,12 +435,21 @@ def append_summary_csv(result_dir: Path, summary: dict[str, Any]) -> None:
         "kv_cache_dtype",
         "tensor_parallel_size",
         "dtype",
+        "max_model_len",
+        "max_tokens",
+        "max_num_seqs",
+        "base_prompt_count",
         "prompt_count",
+        "warmup_prompts",
+        "repeats",
+        "include_text",
         "avg_ms_per_token",
         "avg_ttft_ms",
         "avg_decode_ms_per_token",
         "baseline_gpu_memory_mib",
         "post_load_gpu_memory_mib",
+        "load_peak_gpu_memory_mib",
+        "measured_peak_gpu_memory_mib",
         "peak_gpu_memory_mib",
         "final_gpu_memory_mib",
     ]
@@ -390,7 +473,9 @@ def main() -> None:
 
     append_summary_csv(result_dir, summary)
 
-    print(json.dumps(summary, indent=2))
+    console_summary = {key: value for key, value in summary.items() if key != "per_prompt"}
+    console_summary["per_prompt_count"] = len(summary["per_prompt"])
+    print(json.dumps(console_summary, indent=2))
     print(f"Saved benchmark summary to {json_path}")
 
 
