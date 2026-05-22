@@ -65,11 +65,19 @@ def build_dataset(tokenizer, dataset_id: str, dataset_split: str, nsamples: int)
     dataset = dataset.shuffle(seed=42)
 
     def preprocess(example):
-        return {
-            "text": tokenizer.apply_chat_template(
-                example["messages"],
+        messages = example["messages"]
+        if getattr(tokenizer, "chat_template", None):
+            text = tokenizer.apply_chat_template(
+                messages,
                 tokenize=False,
             )
+        else:
+            text = "\n".join(
+                f"{message.get('role', 'user')}: {message.get('content', '')}"
+                for message in messages
+            )
+        return {
+            "text": text,
         }
 
     return dataset.map(preprocess)

@@ -15,6 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-$SCRIPT_DIR}"
 ACTION="${1:-all}"
 RAW_MODEL_ID="${RAW_MODEL_ID:-meta-llama/Meta-Llama-3-8B-Instruct}"
+BASE_MODEL_ID="${BASE_MODEL_ID:-meta-llama/Meta-Llama-3-8B}"
 
 COMPRESS_PY="${COMPRESS_PY:-$REPO_DIR/.conda/llm-compressor/bin/python}"
 VLLM_PY="${VLLM_PY:-$REPO_DIR/.conda/vllm/bin/python}"
@@ -31,9 +32,12 @@ DATASET_CACHE_ROOT="$CACHE_ROOT/datasets"
 
 AWQ_MODEL_DIR="${AWQ_MODEL_DIR:-$MODEL_ROOT/llama-3-8b-instruct-awq-w4a16}"
 AWQ_FP8_KV_MODEL_DIR="${AWQ_FP8_KV_MODEL_DIR:-$MODEL_ROOT/llama-3-8b-instruct-awq-w4a16-fp8-kv}"
+BASE_AWQ_MODEL_DIR="${BASE_AWQ_MODEL_DIR:-$MODEL_ROOT/llama-3-8b-awq-w4a16}"
+BASE_AWQ_FP8_KV_MODEL_DIR="${BASE_AWQ_FP8_KV_MODEL_DIR:-$MODEL_ROOT/llama-3-8b-awq-w4a16-fp8-kv}"
 BENCHMARK_RESULT_DIR="${BENCHMARK_RESULT_DIR:-$RESULT_ROOT/llama-3-8b-instruct}"
 KV_BENCHMARK_RESULT_DIR="${KV_BENCHMARK_RESULT_DIR:-$RESULT_ROOT/llama-3-8b-instruct-kv}"
 CONCURRENCY_RESULT_DIR="${CONCURRENCY_RESULT_DIR:-$RESULT_ROOT/llama-3-8b-instruct-concurrency}"
+PPL_RESULT_DIR="${PPL_RESULT_DIR:-$RESULT_ROOT/llama-3-8b-instruct-ppl}"
 KV_PROMPT_FILE="${KV_PROMPT_FILE:-$PROMPT_ROOT/kv_long_prompts.txt}"
 
 NUM_CALIBRATION_SAMPLES="${NUM_CALIBRATION_SAMPLES:-256}"
@@ -48,14 +52,20 @@ BENCH_WARMUP_PROMPTS="${BENCH_WARMUP_PROMPTS:-1}"
 BENCH_REPEATS="${BENCH_REPEATS:-1}"
 PROBE_TARGET_INPUT_TOKENS="${PROBE_TARGET_INPUT_TOKENS:-7600}"
 PROBE_MAX_TOKENS="${PROBE_MAX_TOKENS:-64}"
+PPL_SEQ_LEN="${PPL_SEQ_LEN:-512}"
+PPL_STRIDE="${PPL_STRIDE:-$PPL_SEQ_LEN}"
+PPL_MAX_SAMPLES="${PPL_MAX_SAMPLES-128}"
+PPL_MAX_MODEL_LEN="${PPL_MAX_MODEL_LEN:-$BENCH_MAX_MODEL_LEN}"
+PPL_GPU_MEMORY_UTILIZATION="${PPL_GPU_MEMORY_UTILIZATION:-0.75}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 VLLM_DTYPE="${VLLM_DTYPE:-auto}"
 PROMPT_FILE="${PROMPT_FILE:-}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 
 mkdir -p "$MODEL_ROOT" "$RESULT_ROOT" "$LOG_ROOT" "$PROMPT_ROOT" "$AWQ_MODEL_DIR" \
-    "$AWQ_FP8_KV_MODEL_DIR" "$BENCHMARK_RESULT_DIR" "$HF_CACHE_ROOT" \
-    "$DATASET_CACHE_ROOT" "$KV_BENCHMARK_RESULT_DIR" "$CONCURRENCY_RESULT_DIR"
+    "$AWQ_FP8_KV_MODEL_DIR" "$BASE_AWQ_MODEL_DIR" "$BASE_AWQ_FP8_KV_MODEL_DIR" \
+    "$BENCHMARK_RESULT_DIR" "$HF_CACHE_ROOT" "$DATASET_CACHE_ROOT" \
+    "$KV_BENCHMARK_RESULT_DIR" "$CONCURRENCY_RESULT_DIR" "$PPL_RESULT_DIR"
 
 if [[ -n "${HF_TOKEN:-}" ]]; then
     export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
@@ -118,10 +128,12 @@ common_benchmark_args() {
 
 quantize_awq() {
     require_token
+    local model_id="${1:-$RAW_MODEL_ID}"
+    local output_dir="${2:-$AWQ_MODEL_DIR}"
     local args=(
         scripts/quantize_llama_awq.py
-        --model-id "$RAW_MODEL_ID"
-        --output-dir "$AWQ_MODEL_DIR"
+        --model-id "$model_id"
+        --output-dir "$output_dir"
         --num-calibration-samples "$NUM_CALIBRATION_SAMPLES"
         --max-seq-length "$CALIBRATION_MAX_SEQ_LEN"
     )
@@ -133,11 +145,13 @@ quantize_awq() {
 
 quantize_awq_fp8_kv() {
     require_token
+    local model_id="${1:-$RAW_MODEL_ID}"
+    local output_dir="${2:-$AWQ_FP8_KV_MODEL_DIR}"
     local args=(
         scripts/quantize_llama_awq.py
-        --model-id "$RAW_MODEL_ID"
+        --model-id "$model_id"
         --with-fp8-kv
-        --output-dir "$AWQ_FP8_KV_MODEL_DIR"
+        --output-dir "$output_dir"
         --num-calibration-samples "$NUM_CALIBRATION_SAMPLES"
         --max-seq-length "$CALIBRATION_MAX_SEQ_LEN"
     )
@@ -145,6 +159,19 @@ quantize_awq_fp8_kv() {
         args+=(--skip-sanity-generation)
     fi
     "$COMPRESS_PY" "${args[@]}"
+}
+
+quantize_base_awq() {
+    quantize_awq "$BASE_MODEL_ID" "$BASE_AWQ_MODEL_DIR"
+}
+
+quantize_base_awq_fp8_kv() {
+    quantize_awq_fp8_kv "$BASE_MODEL_ID" "$BASE_AWQ_FP8_KV_MODEL_DIR"
+}
+
+quantize_base() {
+    quantize_base_awq
+    quantize_base_awq_fp8_kv
 }
 
 benchmark_raw() {
@@ -320,12 +347,133 @@ probe_concurrency() {
     probe_concurrency_fp8_kv
 }
 
+common_ppl_args() {
+    local label="$1"
+    local model="$2"
+    local tokenizer_model="$RAW_MODEL_ID"
+    shift 2
+    if [[ $# -gt 0 && "$1" != --* ]]; then
+        tokenizer_model="$1"
+        shift
+    fi
+
+    local args=(
+        scripts/evaluate_ppl_vllm.py
+        --model "$model"
+        --tokenizer-model "$tokenizer_model"
+        --label "$label"
+        --result-dir "$PPL_RESULT_DIR"
+        --seq-len "$PPL_SEQ_LEN"
+        --stride "$PPL_STRIDE"
+        --max-model-len "$PPL_MAX_MODEL_LEN"
+        --gpu-memory-utilization "$PPL_GPU_MEMORY_UTILIZATION"
+        --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
+        --dtype "$VLLM_DTYPE"
+    )
+
+    if [[ -n "$PPL_MAX_SAMPLES" ]]; then
+        args+=(--max-samples "$PPL_MAX_SAMPLES")
+    fi
+    if [[ -n "$BENCH_MAX_NUM_SEQS" ]]; then
+        args+=(--max-num-seqs "$BENCH_MAX_NUM_SEQS")
+    fi
+    if [[ "$ENFORCE_EAGER" == "1" || "$ENFORCE_EAGER" == "true" ]]; then
+        args+=(--enforce-eager)
+    fi
+
+    "$VLLM_PY" "${args[@]}" "$@"
+}
+
+common_ppl_transformers_args() {
+    local label="$1"
+    local model="$2"
+    local tokenizer_model="$RAW_MODEL_ID"
+    shift 2
+    if [[ $# -gt 0 && "$1" != --* ]]; then
+        tokenizer_model="$1"
+        shift
+    fi
+
+    local args=(
+        scripts/evaluate_ppl_transformers.py
+        --model "$model"
+        --tokenizer-model "$tokenizer_model"
+        --label "$label"
+        --result-dir "$PPL_RESULT_DIR"
+        --seq-len "$PPL_SEQ_LEN"
+        --dtype "$VLLM_DTYPE"
+    )
+
+    if [[ -n "$PPL_MAX_SAMPLES" ]]; then
+        args+=(--max-samples "$PPL_MAX_SAMPLES")
+    fi
+
+    "$COMPRESS_PY" "${args[@]}" "$@"
+}
+
+ppl_raw() {
+    require_token
+    common_ppl_args "llama3_raw_ppl" "$RAW_MODEL_ID"
+}
+
+ppl_awq() {
+    common_ppl_args "llama3_awq_w4a16_ppl" "$AWQ_MODEL_DIR"
+}
+
+ppl_awq_fp8_kv() {
+    common_ppl_args "llama3_awq_w4a16_fp8_kv_ppl" "$AWQ_FP8_KV_MODEL_DIR" "$RAW_MODEL_ID" \
+        --kv-cache-dtype fp8
+}
+
+ppl() {
+    ppl_raw
+    ppl_awq
+    ppl_awq_fp8_kv
+}
+
+ppl_base_raw() {
+    require_token
+    common_ppl_args "llama3_base_raw_ppl" "$BASE_MODEL_ID" "$BASE_MODEL_ID"
+}
+
+ppl_base_awq() {
+    common_ppl_args "llama3_base_awq_w4a16_ppl" "$BASE_AWQ_MODEL_DIR" "$BASE_MODEL_ID"
+}
+
+ppl_base_awq_fp8_kv() {
+    common_ppl_args "llama3_base_awq_w4a16_fp8_kv_ppl" "$BASE_AWQ_FP8_KV_MODEL_DIR" "$BASE_MODEL_ID" \
+        --kv-cache-dtype fp8
+}
+
+ppl_base() {
+    ppl_base_raw
+    ppl_base_awq
+    ppl_base_awq_fp8_kv
+}
+
+ppl_tf_awq() {
+    common_ppl_transformers_args "llama3_awq_w4a16_ppl_transformers" "$AWQ_MODEL_DIR" "$RAW_MODEL_ID"
+}
+
+ppl_tf_awq_fp8_kv() {
+    common_ppl_transformers_args "llama3_awq_w4a16_fp8_kv_ppl_transformers" "$AWQ_FP8_KV_MODEL_DIR" "$RAW_MODEL_ID"
+}
+
+ppl_tf_base_awq() {
+    common_ppl_transformers_args "llama3_base_awq_w4a16_ppl_transformers" "$BASE_AWQ_MODEL_DIR" "$BASE_MODEL_ID"
+}
+
+ppl_tf_base_awq_fp8_kv() {
+    common_ppl_transformers_args "llama3_base_awq_w4a16_fp8_kv_ppl_transformers" "$BASE_AWQ_FP8_KV_MODEL_DIR" "$BASE_MODEL_ID"
+}
+
 check_gpu_mode() {
     echo "repo: $REPO_DIR"
     echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
     echo "compress python: $COMPRESS_PY"
     echo "vllm python: $VLLM_PY"
     echo "raw model: $RAW_MODEL_ID"
+    echo "base model: $BASE_MODEL_ID"
     echo "awq model dir: $AWQ_MODEL_DIR"
     echo "awq+fp8 kv model dir: $AWQ_FP8_KV_MODEL_DIR"
     echo "benchmark result dir: $BENCHMARK_RESULT_DIR"
@@ -344,6 +492,15 @@ case "$ACTION" in
     quantize)
         quantize_awq
         quantize_awq_fp8_kv
+        ;;
+    quantize_base)
+        quantize_base
+        ;;
+    quantize_base_awq)
+        quantize_base_awq
+        ;;
+    quantize_base_awq_fp8_kv)
+        quantize_base_awq_fp8_kv
         ;;
     benchmark)
         benchmark_raw
@@ -365,6 +522,42 @@ case "$ACTION" in
     probe_concurrency_fp8_kv)
         probe_concurrency_fp8_kv
         ;;
+    ppl)
+        ppl
+        ;;
+    ppl_raw)
+        ppl_raw
+        ;;
+    ppl_awq)
+        ppl_awq
+        ;;
+    ppl_awq_fp8_kv)
+        ppl_awq_fp8_kv
+        ;;
+    ppl_base)
+        ppl_base
+        ;;
+    ppl_base_raw)
+        ppl_base_raw
+        ;;
+    ppl_base_awq)
+        ppl_base_awq
+        ;;
+    ppl_base_awq_fp8_kv)
+        ppl_base_awq_fp8_kv
+        ;;
+    ppl_tf_awq)
+        ppl_tf_awq
+        ;;
+    ppl_tf_awq_fp8_kv)
+        ppl_tf_awq_fp8_kv
+        ;;
+    ppl_tf_base_awq)
+        ppl_tf_base_awq
+        ;;
+    ppl_tf_base_awq_fp8_kv)
+        ppl_tf_base_awq_fp8_kv
+        ;;
     benchmark_raw)
         benchmark_raw
         ;;
@@ -382,7 +575,7 @@ case "$ACTION" in
         benchmark_awq_fp8_kv
         ;;
     *)
-        echo "Usage: bash run.sh [check|quantize|benchmark|benchmark_kv|benchmark_kv_memory|probe_concurrency|probe_concurrency_awq|probe_concurrency_fp8_kv|benchmark_raw|benchmark_awq|benchmark_awq_fp8_kv|all]"
+        echo "Usage: bash run.sh [check|quantize|quantize_base|quantize_base_awq|quantize_base_awq_fp8_kv|benchmark|benchmark_kv|benchmark_kv_memory|probe_concurrency|probe_concurrency_awq|probe_concurrency_fp8_kv|ppl|ppl_raw|ppl_awq|ppl_awq_fp8_kv|ppl_base|ppl_base_raw|ppl_base_awq|ppl_base_awq_fp8_kv|ppl_tf_awq|ppl_tf_awq_fp8_kv|ppl_tf_base_awq|ppl_tf_base_awq_fp8_kv|benchmark_raw|benchmark_awq|benchmark_awq_fp8_kv|all]"
         exit 1
         ;;
 esac
