@@ -36,6 +36,8 @@ DEFAULT_PROMPTS = [
     "Explain the difference between model weights and the KV cache during autoregressive decoding.",
 ]
 
+BYTES_PER_GIB = 1024 ** 3
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -193,6 +195,90 @@ def get_visible_gpu_index() -> int:
     return 0
 
 
+def bytes_to_gib(value: int | float | None) -> float | None:
+    if value is None:
+        return None
+    return value / BYTES_PER_GIB
+
+
+def collect_vllm_capacity_info(engine: AsyncLLMEngine) -> dict[str, Any]:
+    raw_engine = getattr(engine, "engine", None)
+    if raw_engine is None:
+        return {}
+
+    cache_config = getattr(raw_engine, "cache_config", None)
+    model_config = getattr(raw_engine, "model_config", None)
+    model_executor = getattr(raw_engine, "model_executor", None)
+
+    num_gpu_blocks = getattr(cache_config, "num_gpu_blocks", None)
+    num_cpu_blocks = getattr(cache_config, "num_cpu_blocks", None)
+    block_size = getattr(cache_config, "block_size", None)
+    max_model_len = getattr(model_config, "max_model_len", None)
+    max_concurrency = None
+    if num_gpu_blocks is not None and block_size is not None and max_model_len:
+        max_concurrency = num_gpu_blocks * block_size / max_model_len
+
+    worker_wrapper = getattr(model_executor, "driver_worker", None)
+    worker = getattr(worker_wrapper, "worker", worker_wrapper)
+    model_runner = getattr(worker, "model_runner", None)
+
+    cache_block_size_bytes = None
+    if worker is not None and hasattr(worker, "get_cache_block_size_bytes"):
+        cache_block_size_bytes = worker.get_cache_block_size_bytes()
+
+    allocated_kv_cache_memory_bytes = None
+    if num_gpu_blocks is not None and cache_block_size_bytes is not None:
+        allocated_kv_cache_memory_bytes = num_gpu_blocks * cache_block_size_bytes
+
+    requested_memory_bytes = getattr(worker, "requested_memory", None)
+    available_kv_cache_memory_bytes = getattr(
+        worker, "available_kv_cache_memory", None
+    )
+    model_weight_memory_bytes = getattr(model_runner, "model_memory_usage", None)
+    peak_activation_memory_bytes = getattr(worker, "peak_activation_memory", None)
+    non_torch_memory_bytes = getattr(worker, "non_torch_memory", None)
+
+    profiled_non_kv_memory_bytes = None
+    parts = [
+        model_weight_memory_bytes,
+        peak_activation_memory_bytes,
+        non_torch_memory_bytes,
+    ]
+    if all(part is not None for part in parts):
+        profiled_non_kv_memory_bytes = sum(parts)
+
+    return {
+        "vllm_gpu_memory_utilization": getattr(
+            cache_config, "gpu_memory_utilization", None
+        ),
+        "vllm_requested_memory_bytes": requested_memory_bytes,
+        "vllm_requested_memory_gib": bytes_to_gib(requested_memory_bytes),
+        "vllm_model_weight_memory_bytes": model_weight_memory_bytes,
+        "vllm_model_weight_memory_gib": bytes_to_gib(model_weight_memory_bytes),
+        "vllm_peak_activation_memory_bytes": peak_activation_memory_bytes,
+        "vllm_peak_activation_memory_gib": bytes_to_gib(peak_activation_memory_bytes),
+        "vllm_non_torch_memory_bytes": non_torch_memory_bytes,
+        "vllm_non_torch_memory_gib": bytes_to_gib(non_torch_memory_bytes),
+        "vllm_profiled_non_kv_memory_bytes": profiled_non_kv_memory_bytes,
+        "vllm_profiled_non_kv_memory_gib": bytes_to_gib(
+            profiled_non_kv_memory_bytes
+        ),
+        "vllm_available_kv_cache_memory_bytes": available_kv_cache_memory_bytes,
+        "vllm_available_kv_cache_memory_gib": bytes_to_gib(
+            available_kv_cache_memory_bytes
+        ),
+        "vllm_cache_block_size_bytes": cache_block_size_bytes,
+        "vllm_allocated_kv_cache_memory_bytes": allocated_kv_cache_memory_bytes,
+        "vllm_allocated_kv_cache_memory_gib": bytes_to_gib(
+            allocated_kv_cache_memory_bytes
+        ),
+        "vllm_gpu_blocks": num_gpu_blocks,
+        "vllm_cpu_blocks": num_cpu_blocks,
+        "vllm_block_size_tokens": block_size,
+        "vllm_max_concurrency": max_concurrency,
+    }
+
+
 class MemoryTracker:
     def __init__(self, gpu_index: int, interval_s: float = 0.1):
         self.gpu_index = gpu_index
@@ -346,6 +432,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     try:
         post_load_memory = tracker.current_mib()
+        capacity_info = collect_vllm_capacity_info(engine)
         per_prompt_results = []
         for idx in range(args.warmup_prompts):
             prompt = prompts[idx % len(prompts)]
@@ -422,6 +509,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "measured_peak_gpu_memory_mib": measured_peak_memory,
         "peak_gpu_memory_mib": peak_memory,
         "final_gpu_memory_mib": final_memory,
+        **capacity_info,
         "per_prompt": per_prompt_results,
     }
 
@@ -452,9 +540,28 @@ def append_summary_csv(result_dir: Path, summary: dict[str, Any]) -> None:
         "measured_peak_gpu_memory_mib",
         "peak_gpu_memory_mib",
         "final_gpu_memory_mib",
+        "vllm_gpu_memory_utilization",
+        "vllm_requested_memory_gib",
+        "vllm_profiled_non_kv_memory_gib",
+        "vllm_available_kv_cache_memory_gib",
+        "vllm_allocated_kv_cache_memory_gib",
+        "vllm_cache_block_size_bytes",
+        "vllm_gpu_blocks",
+        "vllm_cpu_blocks",
+        "vllm_block_size_tokens",
+        "vllm_max_concurrency",
     ]
     write_header = not csv_path.exists()
-    with open(csv_path, "a", encoding="utf-8", newline="") as handle:
+    mode = "a"
+    if csv_path.exists():
+        with open(csv_path, "r", encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle)
+            existing_header = next(reader, None)
+        write_header = existing_header != fieldnames
+        if write_header:
+            mode = "w"
+
+    with open(csv_path, mode, encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()

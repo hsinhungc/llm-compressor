@@ -20,6 +20,7 @@ from vllm.sampling_params import RequestOutputKind
 
 from benchmark_vllm import (
     MemoryTracker,
+    collect_vllm_capacity_info,
     count_completion_tokens,
     format_model_ref,
     get_visible_gpu_index,
@@ -208,6 +209,7 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
 
     try:
         post_load_memory = tracker.current_mib()
+        capacity_info = collect_vllm_capacity_info(engine)
         level_results = []
         for level in levels:
             tracker.reset()
@@ -244,6 +246,7 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         "baseline_gpu_memory_mib": baseline_memory,
         "post_load_gpu_memory_mib": post_load_memory,
         "final_gpu_memory_mib": final_memory,
+        **capacity_info,
         "levels": level_results,
     }
 
